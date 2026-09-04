@@ -58,12 +58,23 @@
  */
 typedef struct {
     const char *name;        /* Nombre textual del comando que el usuario escribe (e.g., 'd_create') */
-    const char *category;    /* Categoría de ordenación: "datos", "memoria", "monitoreo", "utilidades" */
+    const char *category;    /* Categoría de ordenación: "datos", "memoria", "monitoreo", "utilidades", "edicion" */
     const char *usage;       /* Sintaxis de uso del comando para mostrar en caso de error */
     const char *description; /* Explicación en español de lo que hace el comando a nivel lógico */
     const char *syscalls;    /* Explicación de las syscalls involucradas que se mostrarán en la ayuda */
     int (*handler)(int argc, char **argv); /* Puntero a la función que implementa la lógica del comando */
 } Command;
+
+/**
+ * ====================================================================================
+ * Utilidad Compartida: Tokenizador de Línea de Comandos
+ * ====================================================================================
+ * Definida en main.c. Se expone aquí para que otros módulos (como cat_editor.c)
+ * puedan reutilizar exactamente la misma lógica de parseo (incluyendo el soporte de
+ * comillas dobles para argumentos con espacios) dentro de sus propios sub-REPLs,
+ * garantizando comportamiento consistente en todo el shell.
+ */
+int parse_line(char *line, char **argv);
 
 /* ====================================================================================
  * Declaración de Prototipos de Comandos
@@ -92,5 +103,8 @@ int cmd_saludar(int argc, char **argv);   /* Syscalls: getuid */
 int cmd_despedir(int argc, char **argv);  /* Syscalls: getuid */
 int cmd_hora(int argc, char **argv);      /* Syscalls: time */
 int cmd_fecha(int argc, char **argv);     /* Syscalls: time */
+
+/* --- Categoría: Edición (cat_editor.c) --- */
+int cmd_editor(int argc, char **argv);    /* Syscalls: open, read, write, lseek, ftruncate, close */
 
 #endif /* SHELL_H */

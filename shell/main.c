@@ -125,6 +125,20 @@ Command commands[] = {
         "Muestra la fecha actual del sistema.",
         "time(2)",
         cmd_fecha
+    },
+
+    /* --- Categoría: Edición (cat_editor.c) ---
+     * Comando de entrada al editor de texto interactivo (Proyecto Editor de Texto
+     * en Unix). A diferencia de los demás comandos, 'editor' lanza su propio
+     * sub-REPL con estado persistente (archivo abierto + buffer de líneas) hasta
+     * que el usuario escribe 'q', momento en el que regresa al prompt del shell.
+     */
+    {
+        "editor", "edicion",
+        "editor [archivo]",
+        "Editor de texto interactivo con comandos o/p/a/d/q sobre un archivo.",
+        "open(2), read(2), write(2), lseek(2), ftruncate(2), close(2)",
+        cmd_editor
     }
 };
 
@@ -138,6 +152,10 @@ const int num_commands = sizeof(commands) / sizeof(commands[0]);
  * Esta función toma la línea de entrada introducida por el usuario y la divide en 
  * argumentos individuales. Soporta comillas dobles (") para permitir argumentos
  * que contienen espacios en blanco, como en: d_create archivo.txt "Este es el texto"
+ *
+ * Se declara (no static) y se expone en shell.h para que otros módulos, como
+ * cat_editor.c, puedan reutilizarla dentro de sus propios sub-REPLs y mantener un
+ * comportamiento de parseo consistente en todo el shell.
  *
  * Parámetros:
  * - line: La línea cruda leída del teclado. Modificada in-situ colocando caracteres nulos (\0).
@@ -205,7 +223,8 @@ void print_help(const char *arg) {
         printf("  " COLOR_CATEGORY "datos" COLOR_RESET "      - Comandos de archivos y datos (open, read, write, stat, ...)\n");
         printf("  " COLOR_CATEGORY "memoria" COLOR_RESET "    - Comandos de control de heap y memoria (sbrk, mmap, ...)\n");
         printf("  " COLOR_CATEGORY "monitoreo" COLOR_RESET "  - Comandos de procesos, señales y recursos (fork, exec, kill, getrusage)\n");
-        printf("  " COLOR_CATEGORY "utilidades" COLOR_RESET " - Comandos útiles del sistema (saludar, hora, fecha, despedir)\n\n");
+        printf("  " COLOR_CATEGORY "utilidades" COLOR_RESET " - Comandos útiles del sistema (saludar, hora, fecha, despedir)\n");
+        printf("  " COLOR_CATEGORY "edicion" COLOR_RESET "    - Editor de texto interactivo (open, read, write, lseek, ftruncate, close)\n\n");
         printf("Uso general:\n");
         printf("  " COLOR_PROMPT "help <categoria>" COLOR_RESET "  - Muestra comandos específicos de una categoría.\n");
         printf("  " COLOR_PROMPT "help <comando>" COLOR_RESET "    - Explica el uso y las syscalls de un comando específico.\n");
@@ -216,7 +235,8 @@ void print_help(const char *arg) {
 
     /* Caso 2: El usuario escribió 'help <categoria>': Mostrar comandos del grupo */
     if (strcmp(arg, "datos") == 0 || strcmp(arg, "memoria") == 0 || 
-        strcmp(arg, "monitoreo") == 0 || strcmp(arg, "utilidades") == 0) {
+        strcmp(arg, "monitoreo") == 0 || strcmp(arg, "utilidades") == 0 ||
+        strcmp(arg, "edicion") == 0) {
         printf(COLOR_TITLE "\n--- Categoría: %s ---\n" COLOR_RESET, arg);
         for (int i = 0; i < num_commands; i++) {
             if (strcmp(commands[i].category, arg) == 0) {
