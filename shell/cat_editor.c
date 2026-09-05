@@ -323,7 +323,13 @@ int cmd_editor(int argc, char **argv) {
         printf(COLOR_INFO "Use 'o <archivo>' para abrir o crear un archivo.\n" COLOR_RESET);
     }
 
-    char line[MAX_LINE_LEN];
+    /* Buffer de lectura de comandos: deliberadamente más grande que MAX_LINE_LEN
+     * (que limita el tamaño de una línea GUARDADA en el archivo) para reducir la
+     * probabilidad de truncar un comando "a <texto>" a mitad de camino. Aun así,
+     * si el texto ingresado supera este buffer, se detecta y se descarta el
+     * sobrante (ver más abajo) en vez de dejarlo corromper el siguiente comando. */
+    #define EDITOR_CMD_BUF_LEN (MAX_LINE_LEN * 4)
+    char line[EDITOR_CMD_BUF_LEN];
     char *eargv[MAX_EDITOR_ARGS];
 
     while (1) {
@@ -331,9 +337,38 @@ int cmd_editor(int argc, char **argv) {
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
-            /* EOF (Ctrl+D): salvaguarda para no dejar el proceso colgado */
+            /* EOF (Ctrl+D): no se puede pedir confirmación porque ya no hay más
+             * entrada disponible por STDIN. Se avisa explícitamente si había
+             * cambios sin guardar (en vez de descartarlos en silencio) y, en
+             * cualquier caso, se cierra el FD y se libera la memoria para no
+             * dejar recursos abiertos durante el resto de la sesión del shell. */
             printf("\n");
+            if (ed.fd != -1 && ed.modified) {
+                printf(COLOR_ERROR "Advertencia: se salió con EOF (Ctrl+D) y había cambios sin guardar. Se descartaron.\n" COLOR_RESET);
+            }
+            if (ed.fd != -1) {
+                LOG_SYSCALL("close", "%d", ed.fd);
+                int cres = close(ed.fd);
+                if (cres == -1) LOG_SYSCALL_ERROR(strerror(errno));
+                else LOG_SYSCALL_RESULT(cres);
+            }
+            editor_liberar(&ed);
             break;
+        }
+
+        /* Detectar truncamiento: si la línea leída no terminó en '\n' (y no fue
+         * por EOF), significa que el comando ingresado superó el tamaño del
+         * buffer. En ese caso se debe descartar todo el sobrante que sigue
+         * pendiente en stdin; de lo contrario, ese sobrante sería leído por el
+         * siguiente fgets() y se interpretaría erróneamente como un comando
+         * nuevo, corrompiendo la secuencia de comandos del usuario. */
+        size_t line_len = strlen(line);
+        if (line_len > 0 && line[line_len - 1] != '\n') {
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF) {
+                /* descartar carácter sobrante */
+            }
+            printf(COLOR_ERROR "Advertencia: el comando ingresado excede el máximo de %d caracteres y fue truncado.\n" COLOR_RESET, EDITOR_CMD_BUF_LEN - 1);
         }
 
         int eargc = parse_line(line, eargv);
