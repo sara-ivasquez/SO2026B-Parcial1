@@ -105,6 +105,6 @@ int cmd_hora(int argc, char **argv);      /* Syscalls: time */
 int cmd_fecha(int argc, char **argv);     /* Syscalls: time */
 
 /* --- Categoría: Edición (cat_editor.c) --- */
-int cmd_editor(int argc, char **argv);    /* Syscalls: open, read, write, lseek, ftruncate, close */
+int cmd_editor(int argc, char **argv);    /* Syscalls: open, read, write, lseek, ftruncate, close. Comandos internos: o, p, a, i, d, s, q */
 
 #endif /* SHELL_H */

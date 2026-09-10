@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "shell.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,8 +13,8 @@
  * Implementa un editor de texto interactivo operado por CLI, integrado como una
  * categoría nueva del shell ("edicion"). El editor abre su propio sub-REPL: una vez
  * invocado con el comando 'editor', el usuario queda dentro de un ciclo de lectura
- * de comandos propios (o, p, a, d, q) hasta que escribe 'q', momento en el cual el
- * control regresa al prompt principal del shell (eafitOS>).
+ * de comandos propios (o, p, a, i, d, s, q) hasta que escribe 'q', momento en el cual
+ * el control regresa al prompt principal del shell (eafitOS>).
  *
  * DECISIÓN ARQUITECTÓNICA: Se creó una categoría nueva ("edicion") en lugar de
  * reutilizar "datos", "memoria", "monitoreo" o "utilidades", porque el editor
@@ -21,6 +22,20 @@
  * memoria) a través de múltiples comandos consecutivos, mientras que el resto de
  * comandos del shell son operaciones atómicas de un solo disparo que no requieren
  * mantener contexto entre invocaciones.
+ *
+ * MODELO DE PERSISTENCIA: cada comando mutador (a, i, d) escribe su cambio EN DISCO
+ * de forma inmediata, usando exclusivamente open/read/write/lseek/ftruncate/close.
+ * En particular, 'i' (inserción arbitraria) y 'd' (borrado) NO cargan y reescriben
+ * el archivo completo: calculan el offset en bytes donde ocurre el cambio, guardan
+ * en un buffer dinámico (malloc) todo lo que hay después de ese punto, reposicionan
+ * el cursor con lseek() y vuelven a escribir ese buffer desplazado. Esto es la
+ * técnica de "manejo avanzado de lseek y buffers dinámicos para no perder datos al
+ * desplazar bytes" que exige el reto técnico del nivel de dos integrantes.
+ *
+ * Se mantiene además un arreglo en memoria (lines[]) como CACHÉ de lectura para que
+ * 'p' y 's' no tengan que releer el disco en cada invocación; ese arreglo se
+ * actualiza en el mismo instante en que se escribe a disco, así que nunca queda
+ * desincronizado.
  *
  * RESTRICCIÓN DE I/O: Todo acceso al archivo de texto se realiza exclusivamente con
  * open(), read(), write(), lseek(), ftruncate() y close(). Las funciones de alto
@@ -38,20 +53,75 @@
  * Vive en el stack de cmd_editor() durante toda la sesión del sub-REPL.
  */
 typedef struct {
-    char *lines[MAX_LINES];  /* Arreglo de punteros a líneas, cada una reservada con malloc */
+    char *lines[MAX_LINES];  /* Caché en memoria, sincronizada con el disco tras cada operación */
     int   num_lines;         /* Cantidad de líneas actualmente en memoria */
     int   fd;                /* File descriptor del archivo abierto (-1 si no hay ninguno) */
     char  filename[256];     /* Nombre del archivo actualmente abierto */
-    int   modified;          /* Bandera: 1 si hay cambios en memoria sin guardar en disco */
 } EditorState;
 
 /* Prototipos internos (funciones auxiliares, no expuestas fuera de este archivo) */
-static void editor_liberar(EditorState *ed);
-static int  editor_abrir(EditorState *ed, const char *filename);
-static void editor_imprimir(EditorState *ed, const char *arg);
-static void editor_agregar(EditorState *ed, const char *texto);
-static void editor_borrar(EditorState *ed, const char *arg);
-static int  editor_flush(EditorState *ed);
+static void   editor_liberar(EditorState *ed);
+static int    editor_abrir(EditorState *ed, const char *filename);
+static void   editor_imprimir(EditorState *ed, const char *arg);
+static void   editor_agregar(EditorState *ed, const char *texto);
+static void   editor_borrar(EditorState *ed, const char *arg);
+static void   editor_insertar(EditorState *ed, const char *arg_n, const char *texto);
+static void   editor_buscar(EditorState *ed, const char *palabra);
+static off_t  offset_de_linea(EditorState *ed, int n);
+static int    leer_exacto(int fd, void *buf, size_t count);
+static int    escribir_exacto(int fd, const void *buf, size_t count);
+
+/**
+ * ====================================================================================
+ * leer_exacto / escribir_exacto
+ * ====================================================================================
+ * read() y write() pueden transferir MENOS bytes de los pedidos en una sola llamada
+ * (lecturas/escrituras parciales), especialmente con buffers grandes. Estas dos
+ * funciones envuelven el ciclo necesario para garantizar que se lean/escriban
+ * exactamente 'count' bytes antes de continuar, evitando corrupción silenciosa de
+ * datos al desplazar bytes.
+ */
+static int leer_exacto(int fd, void *buf, size_t count) {
+    size_t leidos = 0;
+    while (leidos < count) {
+        LOG_SYSCALL("read", "%d, buffer+%zu, %zu", fd, leidos, count - leidos);
+        ssize_t r = read(fd, (char *)buf + leidos, count - leidos);
+        if (r == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return -1; }
+        LOG_SYSCALL_RESULT(r);
+        if (r == 0) break; /* EOF antes de lo esperado */
+        leidos += (size_t)r;
+    }
+    return (leidos == count) ? 0 : -1;
+}
+
+static int escribir_exacto(int fd, const void *buf, size_t count) {
+    size_t escritos = 0;
+    while (escritos < count) {
+        LOG_SYSCALL("write", "%d, buffer+%zu, %zu", fd, escritos, count - escritos);
+        ssize_t w = write(fd, (const char *)buf + escritos, count - escritos);
+        if (w == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return -1; }
+        LOG_SYSCALL_RESULT(w);
+        escritos += (size_t)w;
+    }
+    return 0;
+}
+
+/**
+ * ====================================================================================
+ * offset_de_linea
+ * ====================================================================================
+ * Calcula el offset en bytes, dentro del archivo en disco, donde EMPIEZA la línea
+ * n (1-indexada), sumando la longitud de cada línea anterior más su '\n'. Para
+ * n == num_lines + 1 devuelve el offset del final del contenido conocido (útil
+ * para insertar después de la última línea).
+ */
+static off_t offset_de_linea(EditorState *ed, int n) {
+    off_t offset = 0;
+    for (int i = 0; i < n - 1; i++) {
+        offset += (off_t)strlen(ed->lines[i]) + 1; /* +1 por el '\n' */
+    }
+    return offset;
+}
 
 /**
  * ====================================================================================
@@ -68,7 +138,6 @@ static void editor_liberar(EditorState *ed) {
     ed->num_lines = 0;
     ed->fd = -1;
     ed->filename[0] = '\0';
-    ed->modified = 0;
 }
 
 /**
@@ -76,7 +145,9 @@ static void editor_liberar(EditorState *ed) {
  * editor_abrir <archivo>
  * ====================================================================================
  * Abre (o crea, si no existe) el archivo indicado y carga su contenido completo a
- * memoria, partiéndolo en líneas por el carácter '\n'.
+ * memoria como CACHÉ de lectura, partiéndolo en líneas por el carácter '\n'. Los
+ * cambios posteriores (a, i, d) escriben directamente a disco y actualizan esta
+ * caché en el mismo momento, para que 'p' y 's' no tengan que releer el archivo.
  *
  * Syscalls: open(2) con O_RDWR | O_CREAT, read(2) en bucle hasta EOF.
  */
@@ -139,7 +210,11 @@ static int editor_abrir(EditorState *ed, const char *filename) {
     }
     content[len] = '\0';
 
-    /* Partir el contenido acumulado por '\n' y poblar el arreglo lines[] */
+    /* Partir el contenido acumulado por '\n' y poblar el arreglo lines[].
+     * NOTA: si el archivo NO termina en '\n', esa última línea sin salto se
+     * carga igual, pero a partir de aquí toda escritura (a/i/d) normaliza el
+     * archivo agregando '\n' al final de cada línea que toca, así que tras la
+     * primera operación mutadora el archivo siempre queda bien terminado. */
     ed->num_lines = 0;
     size_t start = 0;
     for (size_t i = 0; i < len && ed->num_lines < MAX_LINES; i++) {
@@ -167,7 +242,6 @@ static int editor_abrir(EditorState *ed, const char *filename) {
     ed->fd = fd;
     strncpy(ed->filename, filename, sizeof(ed->filename) - 1);
     ed->filename[sizeof(ed->filename) - 1] = '\0';
-    ed->modified = 0;
 
     printf(COLOR_RESULT "Archivo '%s' abierto (%d líneas).\n" COLOR_RESET, filename, ed->num_lines);
     return 0;
@@ -203,8 +277,8 @@ static void editor_imprimir(EditorState *ed, const char *arg) {
  * ====================================================================================
  * editor_agregar <texto>
  * ====================================================================================
- * Añade una nueva línea al final del buffer EN MEMORIA. La escritura real a disco
- * se difiere hasta que el usuario confirme el guardado con 'q' (ver editor_flush).
+ * Añade una nueva línea al final del archivo, escribiendo directamente a disco.
+ * Syscalls: lseek(SEEK_END) para posicionarse al final, write() del texto y del '\n'.
  */
 static void editor_agregar(EditorState *ed, const char *texto) {
     if (ed->fd == -1) {
@@ -215,22 +289,164 @@ static void editor_agregar(EditorState *ed, const char *texto) {
         printf(COLOR_ERROR "Se alcanzó el máximo de %d líneas.\n" COLOR_RESET, MAX_LINES);
         return;
     }
-    char *nueva = strdup(texto ? texto : "");
-    if (!nueva) {
-        printf(COLOR_ERROR "Error de memoria.\n" COLOR_RESET);
+
+    LOG_SYSCALL("lseek", "%d, 0, SEEK_END", ed->fd);
+    off_t pos = lseek(ed->fd, 0, SEEK_END);
+    if (pos == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); return; }
+    LOG_SYSCALL_RESULT(pos);
+
+    const char *t = texto ? texto : "";
+    size_t tlen = strlen(t);
+    if (escribir_exacto(ed->fd, t, tlen) == -1 || escribir_exacto(ed->fd, "\n", 1) == -1) {
+        printf(COLOR_ERROR "Error al escribir la nueva línea en disco.\n" COLOR_RESET);
         return;
     }
-    ed->lines[ed->num_lines++] = nueva;
-    ed->modified = 1;
-    printf(COLOR_RESULT "Línea %d añadida en memoria (use 'q' para guardar en disco).\n" COLOR_RESET, ed->num_lines);
+
+    /* Reflejar en la caché de memoria */
+    ed->lines[ed->num_lines++] = strdup(t);
+
+    printf(COLOR_RESULT "Línea %d añadida y guardada en disco.\n" COLOR_RESET, ed->num_lines);
+}
+
+/**
+ * ====================================================================================
+ * editor_insertar <n> <texto>
+ * ====================================================================================
+ * Inserta una nueva línea en la posición n, DIRECTAMENTE EN DISCO, desplazando los
+ * bytes posteriores mediante un buffer dinámico. Pasos:
+ *
+ *   1. Calcular el offset en bytes donde debe insertarse la nueva línea.
+ *   2. Averiguar el tamaño total del archivo (lseek a SEEK_END).
+ *   3. Leer TODO lo que hay después de ese offset hacia un buffer reservado con
+ *      malloc(), para no perderlo al sobrescribir esa zona.
+ *   4. Reposicionar el cursor al offset de inserción con lseek(SEEK_SET).
+ *   5. Escribir el texto nuevo + '\n'.
+ *   6. Escribir a continuación el contenido que se había guardado en el buffer
+ *      (el resto del archivo, ahora desplazado hacia adelante).
+ *   7. Liberar el buffer con free().
+ *
+ * Esta es la técnica de "manejo avanzado de lseek y buffers dinámicos (malloc/free)
+ * para no perder datos al desplazar bytes" que exige el reto técnico del nivel de
+ * dos integrantes.
+ */
+static void editor_insertar(EditorState *ed, const char *arg_n, const char *texto) {
+    if (ed->fd == -1) {
+        printf(COLOR_ERROR "No hay ningún archivo abierto. Use 'o <archivo>' primero.\n" COLOR_RESET);
+        return;
+    }
+    int n = atoi(arg_n ? arg_n : "0");
+    if (n < 1 || n > ed->num_lines + 1) {
+        printf(COLOR_ERROR "Posición %d fuera de rango (1-%d).\n" COLOR_RESET, n, ed->num_lines + 1);
+        return;
+    }
+    if (ed->num_lines >= MAX_LINES) {
+        printf(COLOR_ERROR "Se alcanzó el máximo de %d líneas.\n" COLOR_RESET, MAX_LINES);
+        return;
+    }
+
+    /* 1. Offset donde empieza la línea n actual (o el final conocido, si n es la
+     *    posición siguiente a la última línea). */
+    off_t offset = offset_de_linea(ed, n);
+
+    /* Bloque a insertar: texto + '\n' */
+    const char *t = texto ? texto : "";
+    size_t texto_len = strlen(t);
+    char *bloque_nuevo = malloc(texto_len + 1);
+    if (!bloque_nuevo) { printf(COLOR_ERROR "Error de memoria.\n" COLOR_RESET); return; }
+    memcpy(bloque_nuevo, t, texto_len);
+    bloque_nuevo[texto_len] = '\n';
+    size_t bloque_len = texto_len + 1;
+
+    /* 2. Tamaño total actual del archivo */
+    LOG_SYSCALL("lseek", "%d, 0, SEEK_END", ed->fd);
+    off_t tam_total = lseek(ed->fd, 0, SEEK_END);
+    if (tam_total == (off_t)-1) {
+        LOG_SYSCALL_ERROR(strerror(errno));
+        free(bloque_nuevo);
+        return;
+    }
+    LOG_SYSCALL_RESULT(tam_total);
+
+    /* Salvaguarda: si por un archivo sin '\n' final el offset calculado quedó
+     * más allá del tamaño real, se ajusta al final real del archivo. */
+    if (offset > tam_total) offset = tam_total;
+
+    off_t cola_len = tam_total - offset;
+    char *buffer_cola = NULL;
+    if (cola_len > 0) {
+        /* 3. Leer todo lo posterior al punto de inserción hacia un buffer dinámico */
+        buffer_cola = malloc((size_t)cola_len);
+        if (!buffer_cola) {
+            printf(COLOR_ERROR "Error de memoria.\n" COLOR_RESET);
+            free(bloque_nuevo);
+            return;
+        }
+        LOG_SYSCALL("lseek", "%d, %ld, SEEK_SET", ed->fd, (long)offset);
+        off_t p1 = lseek(ed->fd, offset, SEEK_SET);
+        if (p1 == (off_t)-1) {
+            LOG_SYSCALL_ERROR(strerror(errno));
+            free(bloque_nuevo); free(buffer_cola);
+            return;
+        }
+        LOG_SYSCALL_RESULT(p1);
+
+        if (leer_exacto(ed->fd, buffer_cola, (size_t)cola_len) == -1) {
+            printf(COLOR_ERROR "Error al leer el resto del archivo.\n" COLOR_RESET);
+            free(bloque_nuevo); free(buffer_cola);
+            return;
+        }
+    }
+
+    /* 4. Reposicionar al offset de inserción */
+    LOG_SYSCALL("lseek", "%d, %ld, SEEK_SET", ed->fd, (long)offset);
+    off_t p2 = lseek(ed->fd, offset, SEEK_SET);
+    if (p2 == (off_t)-1) {
+        LOG_SYSCALL_ERROR(strerror(errno));
+        free(bloque_nuevo); free(buffer_cola);
+        return;
+    }
+    LOG_SYSCALL_RESULT(p2);
+
+    /* 5. Escribir el texto nuevo */
+    if (escribir_exacto(ed->fd, bloque_nuevo, bloque_len) == -1) {
+        printf(COLOR_ERROR "Error al escribir la nueva línea.\n" COLOR_RESET);
+        free(bloque_nuevo); free(buffer_cola);
+        return;
+    }
+
+    /* 6. Reescribir la cola guardada, ahora desplazada hacia adelante */
+    if (buffer_cola) {
+        if (escribir_exacto(ed->fd, buffer_cola, (size_t)cola_len) == -1) {
+            printf(COLOR_ERROR "Error al reescribir el resto del archivo.\n" COLOR_RESET);
+            free(bloque_nuevo); free(buffer_cola);
+            return;
+        }
+    }
+
+    /* 7. Liberar los buffers dinámicos */
+    free(bloque_nuevo);
+    free(buffer_cola);
+
+    /* Reflejar el cambio en la caché de memoria, para que 'p' y 's' no
+     * tengan que releer el archivo del disco. */
+    char *nueva_linea_mem = strdup(t);
+    for (int i = ed->num_lines; i > n - 1; i--) {
+        ed->lines[i] = ed->lines[i - 1];
+    }
+    ed->lines[n - 1] = nueva_linea_mem;
+    ed->num_lines++;
+
+    printf(COLOR_RESULT "Línea insertada en la posición %d y guardada en disco.\n" COLOR_RESET, n);
 }
 
 /**
  * ====================================================================================
  * editor_borrar <n>
  * ====================================================================================
- * Elimina la línea n del buffer EN MEMORIA, desplazando los punteros posteriores
- * hacia arriba. Al igual que editor_agregar, no toca el disco de inmediato.
+ * Elimina la línea n DIRECTAMENTE EN DISCO, usando la misma técnica de buffer
+ * dinámico: guarda en memoria todo lo posterior a la línea borrada, reposiciona el
+ * cursor al inicio de esa línea con lseek(), reescribe la cola desplazada y ajusta
+ * el tamaño final del archivo con ftruncate().
  */
 static void editor_borrar(EditorState *ed, const char *arg) {
     if (ed->fd == -1) {
@@ -242,62 +458,94 @@ static void editor_borrar(EditorState *ed, const char *arg) {
         printf(COLOR_ERROR "Línea %d fuera de rango (1-%d).\n" COLOR_RESET, n, ed->num_lines);
         return;
     }
+
+    off_t pos_inicio = offset_de_linea(ed, n);
+    off_t linea_len = (off_t)strlen(ed->lines[n - 1]) + 1; /* incluye su '\n' */
+    off_t pos_fin = pos_inicio + linea_len;
+
+    LOG_SYSCALL("lseek", "%d, 0, SEEK_END", ed->fd);
+    off_t tam_total = lseek(ed->fd, 0, SEEK_END);
+    if (tam_total == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); return; }
+    LOG_SYSCALL_RESULT(tam_total);
+
+    if (pos_fin > tam_total) pos_fin = tam_total; /* salvaguarda por archivos atípicos */
+
+    off_t cola_len = tam_total - pos_fin;
+    char *buffer_cola = NULL;
+    if (cola_len > 0) {
+        buffer_cola = malloc((size_t)cola_len);
+        if (!buffer_cola) { printf(COLOR_ERROR "Error de memoria.\n" COLOR_RESET); return; }
+
+        LOG_SYSCALL("lseek", "%d, %ld, SEEK_SET", ed->fd, (long)pos_fin);
+        off_t p1 = lseek(ed->fd, pos_fin, SEEK_SET);
+        if (p1 == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); free(buffer_cola); return; }
+        LOG_SYSCALL_RESULT(p1);
+
+        if (leer_exacto(ed->fd, buffer_cola, (size_t)cola_len) == -1) {
+            printf(COLOR_ERROR "Error al leer el resto del archivo.\n" COLOR_RESET);
+            free(buffer_cola);
+            return;
+        }
+    }
+
+    LOG_SYSCALL("lseek", "%d, %ld, SEEK_SET", ed->fd, (long)pos_inicio);
+    off_t p2 = lseek(ed->fd, pos_inicio, SEEK_SET);
+    if (p2 == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); free(buffer_cola); return; }
+    LOG_SYSCALL_RESULT(p2);
+
+    if (buffer_cola) {
+        if (escribir_exacto(ed->fd, buffer_cola, (size_t)cola_len) == -1) {
+            printf(COLOR_ERROR "Error al reescribir el resto del archivo.\n" COLOR_RESET);
+            free(buffer_cola);
+            return;
+        }
+    }
+    free(buffer_cola);
+
+    LOG_SYSCALL("ftruncate", "%d, %ld", ed->fd, (long)(pos_inicio + cola_len));
+    int tres = ftruncate(ed->fd, pos_inicio + cola_len);
+    if (tres == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return; }
+    LOG_SYSCALL_RESULT(tres);
+
+    /* Reflejar en la caché de memoria */
     free(ed->lines[n - 1]);
     for (int i = n - 1; i < ed->num_lines - 1; i++) {
         ed->lines[i] = ed->lines[i + 1];
     }
     ed->num_lines--;
-    ed->modified = 1;
-    printf(COLOR_RESULT "Línea %d eliminada en memoria (use 'q' para guardar en disco).\n" COLOR_RESET, n);
+
+    printf(COLOR_RESULT "Línea %d eliminada y guardada en disco.\n" COLOR_RESET, n);
 }
 
 /**
  * ====================================================================================
- * editor_flush
+ * editor_buscar <palabra>
  * ====================================================================================
- * Persiste el buffer en memoria hacia el archivo en disco. Se invoca únicamente
- * cuando el usuario confirma el guardado al salir con 'q'.
- *
- * Syscalls: lseek(2) para volver al inicio del archivo, write(2) por cada línea,
- * ftruncate(2) para eliminar cualquier remanente de una versión anterior más larga.
+ * Búsqueda simple de una subcadena dentro de las líneas de la caché en memoria
+ * (que siempre está sincronizada con el disco tras cada operación). No requiere
+ * tocar el disco. Usa strstr() para detectar coincidencias como subcadena.
  */
-static int editor_flush(EditorState *ed) {
-    /* 1. LLAMADA AL SISTEMA: lseek (reposicionar el cursor al inicio absoluto) */
-    LOG_SYSCALL("lseek", "%d, 0, SEEK_SET", ed->fd);
-    off_t pos = lseek(ed->fd, 0, SEEK_SET);
-    if (pos == (off_t)-1) {
-        LOG_SYSCALL_ERROR(strerror(errno));
-        return -1;
+static void editor_buscar(EditorState *ed, const char *palabra) {
+    if (ed->fd == -1) {
+        printf(COLOR_ERROR "No hay ningún archivo abierto. Use 'o <archivo>' primero.\n" COLOR_RESET);
+        return;
     }
-    LOG_SYSCALL_RESULT(pos);
-
-    off_t total = 0;
+    if (palabra == NULL || palabra[0] == '\0') {
+        printf(COLOR_ERROR "Uso: s <palabra>\n" COLOR_RESET);
+        return;
+    }
+    int encontrados = 0;
     for (int i = 0; i < ed->num_lines; i++) {
-        size_t linelen = strlen(ed->lines[i]);
-
-        /* 2. LLAMADA AL SISTEMA: write (contenido de la línea) */
-        LOG_SYSCALL("write", "%d, linea_%d, %zu", ed->fd, i + 1, linelen);
-        ssize_t w = write(ed->fd, ed->lines[i], linelen);
-        if (w == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return -1; }
-        LOG_SYSCALL_RESULT(w);
-        total += w;
-
-        /* 3. LLAMADA AL SISTEMA: write (separador de línea) */
-        LOG_SYSCALL("write", "%d, \"\\n\", 1", ed->fd);
-        ssize_t wn = write(ed->fd, "\n", 1);
-        if (wn == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return -1; }
-        LOG_SYSCALL_RESULT(wn);
-        total += wn;
+        if (strstr(ed->lines[i], palabra) != NULL) {
+            printf("%3d: %s\n", i + 1, ed->lines[i]);
+            encontrados++;
+        }
     }
-
-    /* 4. LLAMADA AL SISTEMA: ftruncate (ajustar el tamaño exacto del archivo) */
-    LOG_SYSCALL("ftruncate", "%d, %ld", ed->fd, (long)total);
-    int tres = ftruncate(ed->fd, total);
-    if (tres == -1) { LOG_SYSCALL_ERROR(strerror(errno)); return -1; }
-    LOG_SYSCALL_RESULT(tres);
-
-    ed->modified = 0;
-    return 0;
+    if (encontrados == 0) {
+        printf(COLOR_INFO "No se encontraron coincidencias para '%s'.\n" COLOR_RESET, palabra);
+    } else {
+        printf(COLOR_RESULT "%d coincidencia(s) encontrada(s).\n" COLOR_RESET, encontrados);
+    }
 }
 
 /**
@@ -306,15 +554,15 @@ static int editor_flush(EditorState *ed) {
  * ====================================================================================
  * Punto de entrada registrado en la tabla commands[] del shell (categoría "edicion").
  * Lanza un sub-REPL propio que entiende únicamente los comandos base del editor:
- * o, p, a, d, q. Al recibir 'q', cierra el archivo, libera la memoria y retorna el
- * control al bucle principal del shell (eafitOS>).
+ * o, p, a, i, d, s, q. Como cada comando mutador ya persiste en disco de forma
+ * inmediata, 'q' solo necesita cerrar el file descriptor y liberar la memoria.
  */
 int cmd_editor(int argc, char **argv) {
     EditorState ed;
     memset(&ed, 0, sizeof(ed));
     ed.fd = -1;
 
-    printf(COLOR_TITLE "\n--- Editor de Texto Unix (comandos: o, p, a, d, q) ---\n" COLOR_RESET);
+    printf(COLOR_TITLE "\n--- Editor de Texto Unix (comandos: o, p, a, i, d, s, q) ---\n" COLOR_RESET);
 
     /* Si se invocó como 'editor <archivo>', abrirlo automáticamente al entrar */
     if (argc == 2) {
@@ -337,15 +585,10 @@ int cmd_editor(int argc, char **argv) {
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
-            /* EOF (Ctrl+D): no se puede pedir confirmación porque ya no hay más
-             * entrada disponible por STDIN. Se avisa explícitamente si había
-             * cambios sin guardar (en vez de descartarlos en silencio) y, en
-             * cualquier caso, se cierra el FD y se libera la memoria para no
-             * dejar recursos abiertos durante el resto de la sesión del shell. */
+            /* EOF (Ctrl+D): como todos los cambios ya se persistieron al hacerse,
+             * basta con cerrar el FD y liberar la memoria; no hay nada pendiente
+             * que se pueda perder. */
             printf("\n");
-            if (ed.fd != -1 && ed.modified) {
-                printf(COLOR_ERROR "Advertencia: se salió con EOF (Ctrl+D) y había cambios sin guardar. Se descartaron.\n" COLOR_RESET);
-            }
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
@@ -396,29 +639,43 @@ int cmd_editor(int argc, char **argv) {
                 strncat(texto_buf, eargv[i], sizeof(texto_buf) - strlen(texto_buf) - 1);
             }
             editor_agregar(&ed, texto_buf);
+        } else if (strcmp(eargv[0], "i") == 0) {
+            /* i <n> <texto>: igual que 'a', se reconstruye el texto uniendo
+             * todos los tokens a partir del tercero (eargv[2] en adelante),
+             * ya que eargv[1] es la posición numérica n. */
+            if (eargc < 3) {
+                printf(COLOR_ERROR "Uso: i <n> <texto>\n" COLOR_RESET);
+            } else {
+                char texto_buf[MAX_LINE_LEN];
+                texto_buf[0] = '\0';
+                for (int i = 2; i < eargc; i++) {
+                    if (i > 2) {
+                        strncat(texto_buf, " ", sizeof(texto_buf) - strlen(texto_buf) - 1);
+                    }
+                    strncat(texto_buf, eargv[i], sizeof(texto_buf) - strlen(texto_buf) - 1);
+                }
+                editor_insertar(&ed, eargv[1], texto_buf);
+            }
         } else if (strcmp(eargv[0], "d") == 0) {
             if (eargc < 2) {
                 printf(COLOR_ERROR "Uso: d <n>\n" COLOR_RESET);
             } else {
                 editor_borrar(&ed, eargv[1]);
             }
-        } else if (strcmp(eargv[0], "q") == 0) {
-            /* Confirmación de guardado si hay cambios pendientes en memoria */
-            if (ed.fd != -1 && ed.modified) {
-                char resp[16];
-                printf(COLOR_PARAM "Hay cambios sin guardar. ¿Desea guardarlos? (s/n): " COLOR_RESET);
-                fflush(stdout);
-                if (fgets(resp, sizeof(resp), stdin) != NULL &&
-                    (resp[0] == 's' || resp[0] == 'S')) {
-                    if (editor_flush(&ed) == 0) {
-                        printf(COLOR_RESULT "Cambios guardados.\n" COLOR_RESET);
-                    } else {
-                        printf(COLOR_ERROR "Error al guardar los cambios.\n" COLOR_RESET);
-                    }
-                } else {
-                    printf(COLOR_INFO "Cambios descartados.\n" COLOR_RESET);
+        } else if (strcmp(eargv[0], "s") == 0) {
+            /* s <palabra>: si la palabra tiene espacios, se une igual que en
+             * 'a' e 'i', para permitir buscar frases sin necesidad de comillas. */
+            char palabra_buf[MAX_LINE_LEN];
+            palabra_buf[0] = '\0';
+            for (int i = 1; i < eargc; i++) {
+                if (i > 1) {
+                    strncat(palabra_buf, " ", sizeof(palabra_buf) - strlen(palabra_buf) - 1);
                 }
+                strncat(palabra_buf, eargv[i], sizeof(palabra_buf) - strlen(palabra_buf) - 1);
             }
+            editor_buscar(&ed, eargc >= 2 ? palabra_buf : NULL);
+        } else if (strcmp(eargv[0], "q") == 0) {
+            /* Todos los cambios ya están en disco: basta con cerrar y salir. */
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
@@ -429,7 +686,7 @@ int cmd_editor(int argc, char **argv) {
             printf(COLOR_INFO "Saliendo del editor...\n\n" COLOR_RESET);
             break;
         } else {
-            printf(COLOR_ERROR "Comando '%s' no reconocido. Use: o, p, a, d, q\n" COLOR_RESET, eargv[0]);
+            printf(COLOR_ERROR "Comando '%s' no reconocido. Use: o, p, a, i, d, s, q\n" COLOR_RESET, eargv[0]);
         }
     }
 
