@@ -1,0 +1,4 @@
+linea A
+linea B sin salto
+nueva linea con a
+otra linea con i

@@ -70,6 +70,7 @@ static void   editor_buscar(EditorState *ed, const char *palabra);
 static off_t  offset_de_linea(EditorState *ed, int n);
 static int    leer_exacto(int fd, void *buf, size_t count);
 static int    escribir_exacto(int fd, const void *buf, size_t count);
+static int    necesita_salto_previo(int fd);
 
 /**
  * ====================================================================================
@@ -104,6 +105,37 @@ static int escribir_exacto(int fd, const void *buf, size_t count) {
         escritos += (size_t)w;
     }
     return 0;
+}
+
+/**
+ * ====================================================================================
+ * necesita_salto_previo
+ * ====================================================================================
+ * CORRECCIÓN DE BUG: cuando el archivo en disco NO termina en '\n' (por ejemplo,
+ * si fue creado por otro programa sin ese salto final), escribir directamente al
+ * final (SEEK_END) fusionaría el nuevo contenido con la última línea existente,
+ * ya que no habría ningún separador entre ambos. Esta función revisa el ÚLTIMO
+ * BYTE real del archivo: si el archivo no está vacío y ese byte no es '\n',
+ * significa que hace falta escribir un '\n' de más ANTES de agregar contenido
+ * nuevo al final, para no fusionar dos líneas en una sola.
+ */
+static int necesita_salto_previo(int fd) {
+    LOG_SYSCALL("lseek", "%d, 0, SEEK_END", fd);
+    off_t tam = lseek(fd, 0, SEEK_END);
+    if (tam == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); return 0; }
+    LOG_SYSCALL_RESULT(tam);
+
+    if (tam == 0) return 0; /* archivo vacío: no hay nada que separar */
+
+    char ultimo_byte;
+    LOG_SYSCALL("lseek", "%d, %ld, SEEK_SET", fd, (long)(tam - 1));
+    off_t p = lseek(fd, tam - 1, SEEK_SET);
+    if (p == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); return 0; }
+    LOG_SYSCALL_RESULT(p);
+
+    if (leer_exacto(fd, &ultimo_byte, 1) == -1) return 0;
+
+    return (ultimo_byte != '\n');
 }
 
 /**
@@ -290,10 +322,22 @@ static void editor_agregar(EditorState *ed, const char *texto) {
         return;
     }
 
+    /* CORRECCIÓN: si el archivo ya tiene contenido pero su último byte no es
+     * '\n' (por ejemplo, un archivo creado fuera del editor), hace falta
+     * escribir ese salto de línea faltante ANTES del texto nuevo; de lo
+     * contrario, la línea nueva quedaría pegada al final de la última línea
+     * existente en el archivo (aunque en memoria se vieran como separadas). */
+    int falta_salto = necesita_salto_previo(ed->fd);
+
     LOG_SYSCALL("lseek", "%d, 0, SEEK_END", ed->fd);
     off_t pos = lseek(ed->fd, 0, SEEK_END);
     if (pos == (off_t)-1) { LOG_SYSCALL_ERROR(strerror(errno)); return; }
     LOG_SYSCALL_RESULT(pos);
+
+    if (falta_salto && escribir_exacto(ed->fd, "\n", 1) == -1) {
+        printf(COLOR_ERROR "Error al escribir el salto de línea faltante.\n" COLOR_RESET);
+        return;
+    }
 
     const char *t = texto ? texto : "";
     size_t tlen = strlen(t);
@@ -368,8 +412,16 @@ static void editor_insertar(EditorState *ed, const char *arg_n, const char *text
     LOG_SYSCALL_RESULT(tam_total);
 
     /* Salvaguarda: si por un archivo sin '\n' final el offset calculado quedó
-     * más allá del tamaño real, se ajusta al final real del archivo. */
-    if (offset > tam_total) offset = tam_total;
+     * más allá del tamaño real, se ajusta al final real del archivo.
+     * CORRECCIÓN: en ese caso también hace falta escribir el '\n' que le
+     * faltaba a la última línea existente, o de lo contrario el texto nuevo
+     * quedaría pegado a ella en el archivo (aunque en memoria luzcan como
+     * líneas separadas). Se detecta guardando esta condición ANTES de
+     * recortar 'offset', ya que "offset > tam_total" ocurre precisamente
+     * cuando se intenta insertar justo después de una última línea sin
+     * salto de línea final. */
+    int falta_salto_previo = (offset > tam_total);
+    if (falta_salto_previo) offset = tam_total;
 
     off_t cola_len = tam_total - offset;
     char *buffer_cola = NULL;
@@ -407,7 +459,13 @@ static void editor_insertar(EditorState *ed, const char *arg_n, const char *text
     }
     LOG_SYSCALL_RESULT(p2);
 
-    /* 5. Escribir el texto nuevo */
+    /* 5. Si hacía falta, escribir primero el '\n' que le faltaba a la última
+     *    línea existente, y luego el texto nuevo. */
+    if (falta_salto_previo && escribir_exacto(ed->fd, "\n", 1) == -1) {
+        printf(COLOR_ERROR "Error al escribir el salto de línea faltante.\n" COLOR_RESET);
+        free(bloque_nuevo); free(buffer_cola);
+        return;
+    }
     if (escribir_exacto(ed->fd, bloque_nuevo, bloque_len) == -1) {
         printf(COLOR_ERROR "Error al escribir la nueva línea.\n" COLOR_RESET);
         free(bloque_nuevo); free(buffer_cola);
@@ -626,10 +684,6 @@ int cmd_editor(int argc, char **argv) {
         } else if (strcmp(eargv[0], "p") == 0) {
             editor_imprimir(&ed, eargc >= 2 ? eargv[1] : NULL);
         } else if (strcmp(eargv[0], "a") == 0) {
-            /* Reconstruir el texto completo uniendo todos los tokens posteriores a 'a',
-             * para que funcione tanto "a Hola mundo" (sin comillas) como
-             * "a \"Hola mundo\"" (con comillas, vía parse_line). Sin esta unión,
-             * solo se tomaría la primera palabra (eargv[1]) y se perdería el resto. */
             char texto_buf[MAX_LINE_LEN];
             texto_buf[0] = '\0';
             for (int i = 1; i < eargc; i++) {
@@ -640,9 +694,6 @@ int cmd_editor(int argc, char **argv) {
             }
             editor_agregar(&ed, texto_buf);
         } else if (strcmp(eargv[0], "i") == 0) {
-            /* i <n> <texto>: igual que 'a', se reconstruye el texto uniendo
-             * todos los tokens a partir del tercero (eargv[2] en adelante),
-             * ya que eargv[1] es la posición numérica n. */
             if (eargc < 3) {
                 printf(COLOR_ERROR "Uso: i <n> <texto>\n" COLOR_RESET);
             } else {
@@ -663,8 +714,6 @@ int cmd_editor(int argc, char **argv) {
                 editor_borrar(&ed, eargv[1]);
             }
         } else if (strcmp(eargv[0], "s") == 0) {
-            /* s <palabra>: si la palabra tiene espacios, se une igual que en
-             * 'a' e 'i', para permitir buscar frases sin necesidad de comillas. */
             char palabra_buf[MAX_LINE_LEN];
             palabra_buf[0] = '\0';
             for (int i = 1; i < eargc; i++) {
@@ -675,7 +724,6 @@ int cmd_editor(int argc, char **argv) {
             }
             editor_buscar(&ed, eargc >= 2 ? palabra_buf : NULL);
         } else if (strcmp(eargv[0], "q") == 0) {
-            /* Todos los cambios ya están en disco: basta con cerrar y salir. */
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
