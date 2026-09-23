@@ -136,7 +136,7 @@ Command commands[] = {
     {
         "editor", "edicion",
         "editor [archivo]",
-        "Editor de texto interactivo: o/p/a/i/d/s/q (abrir, imprimir, agregar, insertar, borrar, buscar, salir).",,
+        "Editor de texto interactivo: o/p/a/i/d/s/q (abrir, imprimir, agregar, insertar, borrar, buscar, salir).",
         "open(2), read(2), write(2), lseek(2), ftruncate(2), close(2)",
         cmd_editor
     }
