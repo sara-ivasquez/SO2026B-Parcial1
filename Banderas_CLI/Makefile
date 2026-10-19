@@ -1,18 +1,22 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=gnu99 -g -D_GNU_SOURCE
-TARGET = eafitOS
-SRCS = main.c
+ARCHSALIDA = eafitOS
+SRCS = main.c cat_datos.c cat_memoria.c cat_monitoreo.c cat_util.c cat_editor.c
 OBJS = $(SRCS:.c=.o)
 
-all: $(TARGET)
+all: $(ARCHSALIDA)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+$(ARCHSALIDA): $(OBJS)
+	$(CC) $(CFLAGS) -o $(ARCHSALIDA) $(OBJS)
 
-%.o: %.c
+%.o: %.c shell.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(TARGET) $(OBJS)
+# --- Parcial 2: driver de pruebas del núcleo Huffman (Fase 1) ---
+huf: huf_cli.c huffman.c huffman.h
+	$(CC) $(CFLAGS) -pthread -o huf huf_cli.c huffman.c
 
-.PHONY: all clean
+clean:
+	rm -f $(ARCHSALIDA) $(OBJS) huf
+
+.PHONY: all clean huf
