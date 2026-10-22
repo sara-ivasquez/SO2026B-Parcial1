@@ -41,4 +41,55 @@
 int huf_count_parallel(int fd, uint64_t total, uint32_t block_size,
                        ThreadPool *pool, uint64_t freq[HUF_NSYM]);
 
+/**
+ * ====================================================================================
+ * FASE 4 - COMPRESIÓN / DESCOMPRESIÓN EN PARALELO CON SALIDA ORDENADA
+ * ====================================================================================
+ *
+ *   coordinador ──► pool_submit(encode_task b)  (b = 0, 1, 2, ...)
+ *        │            solo si b < next_to_write + VENTANA   (si no, duerme en 'space')
+ *        │
+ *   workers:   pread(bloque b) ─► huf_encode_block ─► results[b] = {datos, listo}
+ *        │                                             si b == next_to_write: signal(ready)
+ *        ▼
+ *   hilo escritor:  while (!results[next].listo) wait(ready)
+ *                   write(results[next]) ; free ; next++ ; signal(space)
+ *
+ * Los bloques pueden TERMINAR en cualquier orden, pero el escritor solo escribe el que
+ * sigue (next_to_write). Si ese aún no está, DUERME en la variable de condición
+ * 'ready' (cero espera activa). La VENTANA limita cuántos bloques hay en memoria a la
+ * vez: sin ella, si el bloque 0 es lento, los demás se acumularían sin límite.
+ *
+ * Por qué no hay interbloqueo: los workers nunca esperan al escritor ni al
+ * coordinador; el escritor solo espera el bloque next_to_write, que SIEMPRE ya fue
+ * enviado (la ventana deja enviar al menos next_to_write..next_to_write+VENTANA-1); y
+ * el coordinador solo espera a que el escritor avance. No hay espera circular.
+ *
+ * El .huf generado es IDÉNTICO byte a byte al de huf_compress_file() (secuencial):
+ * mismo formato, mismo árbol (determinista) y mismo orden de bloques. Por eso cada
+ * versión puede descomprimir lo que produce la otra.
+ */
+
+/* Ganchos opcionales para el editor (Fases 5 y 6). Cualquiera puede ser NULL.
+ *  progress : lo llama SOLO el hilo escritor, después de escribir cada bloque, con los
+ *             bytes ORIGINALES ya procesados. Debe ser rápido y seguro entre hilos.
+ *  cancelled: se consulta entre bloques; si devuelve != 0 la operación se aborta,
+ *             se borra la salida parcial y la función retorna -1 con errno = ECANCELED.
+ */
+typedef struct {
+    HufProgressFn progress;
+    int         (*cancelled)(void *ctx);
+    void         *ctx;
+} HufHooks;
+
+/* Comprime 'in_path' en 'out_path' usando 'pool'. block_size==0 usa HUF_DEFAULT_BLOCK.
+ * Retorna 0 en éxito, -1 en error (mensaje en stderr, errno con la causa, y sin dejar
+ * salida parcial). */
+int huf_compress_file_mt(const char *in_path, const char *out_path, uint32_t block_size,
+                         ThreadPool *pool, const HufHooks *hooks);
+
+/* Descomprime 'in_path' (.huf) en 'out_path' decodificando bloques en paralelo. */
+int huf_decompress_file_mt(const char *in_path, const char *out_path,
+                           ThreadPool *pool, const HufHooks *hooks);
+
 #endif /* HUF_PARALLEL_H */

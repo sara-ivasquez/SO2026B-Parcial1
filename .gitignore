@@ -8,3 +8,5 @@ shell/huffman/test_pool
 shell/huffman/test_pool_tsan
 shell/huffman/test_count
 shell/huffman/test_count_tsan
+shell/huffman/test_parallel
+shell/huffman/test_parallel_tsan
