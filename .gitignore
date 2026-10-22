@@ -2,3 +2,5 @@ shell/*.o
 shell/sys_shell
 Banderas_CLI/*.o
 Banderas_CLI/cli_parser
+shell/eafitOS
+shell/huffman/huf
