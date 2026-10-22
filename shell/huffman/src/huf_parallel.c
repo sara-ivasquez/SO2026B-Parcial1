@@ -386,7 +386,7 @@ static void q_destroy(OutQueue *q) {
 
 int huf_compress_file_mt(const char *in_path, const char *out_path, uint32_t block_size,
                          ThreadPool *pool, const HufHooks *hooks) {
-    int err = 0, fin = -1, fout = -1, q_ready = 0;
+    int err = 0, fin = -1, fout = -1, q_ready = 0, out_reg = 0;
     BlockTask *tasks = NULL;
     OutQueue q;
     uint64_t freq[HUF_NSYM];
@@ -435,6 +435,10 @@ int huf_compress_file_mt(const char *in_path, const char *out_path, uint32_t blo
         fprintf(stderr, "huffman: open('%s'): %s\n", out_path, strerror(err));
         goto done;
     }
+    {   /* solo se borra al fallar si es un archivo normal (no p.ej. /dev/full) */
+        struct stat so;
+        out_reg = fstat(fout, &so) == 0 && S_ISREG(so.st_mode);
+    }
     uint8_t hdr[HUF_HEADER_SIZE];
     memcpy(hdr, HUF_MAGIC, 4);
     put_u64(hdr + 4, total);
@@ -466,7 +470,7 @@ done:
     if (fin != -1) close(fin);
     if (fout != -1 && close(fout) == -1 && !err) { err = errno; perror("huffman: close"); }
     if (err) {
-        if (fout != -1) unlink(out_path);       /* no dejar un .huf a medias */
+        if (out_reg) unlink(out_path);       /* no dejar un .huf a medias */
         errno = err;
         return -1;
     }
@@ -475,7 +479,7 @@ done:
 
 int huf_decompress_file_mt(const char *in_path, const char *out_path,
                            ThreadPool *pool, const HufHooks *hooks) {
-    int err = 0, fin = -1, fout = -1, q_ready = 0;
+    int err = 0, fin = -1, fout = -1, q_ready = 0, out_reg = 0;
     BlockTask *tasks = NULL;
     OutQueue q;
     HufTree tree;
@@ -552,6 +556,10 @@ int huf_decompress_file_mt(const char *in_path, const char *out_path,
         fprintf(stderr, "huffman: open('%s'): %s\n", out_path, strerror(err));
         goto done;
     }
+    {   /* solo se borra al fallar si es un archivo normal (no p.ej. /dev/full) */
+        struct stat so;
+        out_reg = fstat(fout, &so) == 0 && S_ISREG(so.st_mode);
+    }
     q.fd_out = fout;
     q.with_block_header = 0;
     q.total = total;
@@ -564,7 +572,7 @@ done:
     if (fin != -1) close(fin);
     if (fout != -1 && close(fout) == -1 && !err) { err = errno; perror("huffman: close"); }
     if (err) {
-        if (fout != -1) unlink(out_path);
+        if (out_reg) unlink(out_path);
         errno = err;
         return -1;
     }

@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <signal.h>
 
 /**
  * ====================================================================================
@@ -665,9 +667,7 @@ static void dibujar_barra(const JobStatus *st) {
  * antes de imprimir el prompt, desde el hilo del editor). */
 static void notificar_job(void) {
     JobStatus st;
-    job_status(&st);
-    if (!st.unseen) return;
-    job_mark_seen();
+    if (!job_take_unseen(&st)) return;    /* revisar y marcar en un solo paso atómico */
 
     if (st.state == JOB_DONE) {
         struct stat a, b;
@@ -879,6 +879,116 @@ static void editor_cancelar(void) {
 
 /**
  * ====================================================================================
+ * PARCIAL 2, FASE 7 - Ctrl+C (SIGINT) durante una tarea en segundo plano
+ * ====================================================================================
+ * Sin esto, Ctrl+C mata el proceso de golpe: los hilos mueren a mitad de un bloque,
+ * el .huf queda a medias y nada se libera ni se cierra.
+ *
+ * Diseño (el recomendado para programas con hilos):
+ *   1. Al entrar al editor se BLOQUEA SIGINT con pthread_sigmask ANTES de crear
+ *      cualquier hilo. Los hilos heredan la máscara, así que ni el editor, ni el hilo
+ *      job, ni los workers del pool pueden ser interrumpidos por la señal.
+ *   2. Un hilo dedicado ("hilo de señales") la espera con sigwait(). Cuando llega,
+ *      la atiende como CÓDIGO NORMAL (no dentro de un manejador asíncrono), así que
+ *      puede usar mutex y variables de condición sin peligro:
+ *        - si hay una tarea: job_cancel() -> cancelación cooperativa entre bloques,
+ *          el job borra la salida parcial, hace join de los workers y termina;
+ *        - si no hay tarea: solo informa que para salir se usa 'q'.
+ *   3. Al salir del editor el hilo de señales se detiene (se le envía SIGUSR1, que
+ *      también espera con sigwait), se le hace join y se restaura la máscara original:
+ *      fuera del editor, Ctrl+C vuelve a funcionar como en el Parcial 1.
+ *
+ * Pantalla: el hilo de señales solo imprime si el editor está esperando un comando
+ * (no ejecutando uno) y lo hace bajo 'g_salida', el mismo mutex con el que el editor
+ * imprime el prompt. Así los mensajes nunca se mezclan.
+ */
+
+static pthread_mutex_t g_salida = PTHREAD_MUTEX_INITIALIZER;  /* protege g_en_comando y el prompt */
+static int       g_en_comando = 0;   /* 1 = el editor está ejecutando un comando */
+static sigset_t  g_senales;          /* {SIGINT, SIGUSR1}                        */
+static sigset_t  g_mascara_previa;   /* máscara a restaurar al salir             */
+static pthread_t g_hilo_senales;
+static int       g_senales_activas = 0;
+
+static void *hilo_senales(void *arg) {
+    (void)arg;
+    for (;;) {
+        int sig;
+        if (sigwait(&g_senales, &sig) != 0) continue;
+        if (sig == SIGUSR1) break;                /* aviso interno: el editor se cierra */
+
+        /* SIGINT */
+        if (job_cancel() == 0) {
+            job_wait();                           /* duerme hasta que el job se detenga */
+            pthread_mutex_lock(&g_salida);
+            if (!g_en_comando) {                  /* el editor está esperando en fgets */
+                printf("\n" COLOR_INFO "(Ctrl+C) Tarea en segundo plano cancelada.\n" COLOR_RESET);
+                notificar_job();
+                imprimir_prompt();
+            }
+            pthread_mutex_unlock(&g_salida);
+        } else if (!job_busy()) {
+            pthread_mutex_lock(&g_salida);
+            if (!g_en_comando) {
+                printf("\n" COLOR_INFO "(Ctrl+C) No hay ninguna tarea en curso. Use 'q' para salir del editor.\n" COLOR_RESET);
+                imprimir_prompt();
+            }
+            pthread_mutex_unlock(&g_salida);
+        }
+        /* (si ya se estaba cancelando, un segundo Ctrl+C no hace nada más) */
+    }
+    return NULL;
+}
+
+static void senales_iniciar(void) {
+    sigemptyset(&g_senales);
+    sigaddset(&g_senales, SIGINT);
+    sigaddset(&g_senales, SIGUSR1);
+    int rc = pthread_sigmask(SIG_BLOCK, &g_senales, &g_mascara_previa);
+    if (rc == 0) rc = pthread_create(&g_hilo_senales, NULL, hilo_senales, NULL);
+    if (rc != 0) {
+        pthread_sigmask(SIG_SETMASK, &g_mascara_previa, NULL);
+        printf(COLOR_ERROR "Aviso: no se pudo preparar el manejo de Ctrl+C (%s).\n" COLOR_RESET, strerror(rc));
+        return;
+    }
+    g_senales_activas = 1;
+}
+
+static void senales_detener(void) {
+    if (!g_senales_activas) return;
+    pthread_kill(g_hilo_senales, SIGUSR1);        /* lo despierta de sigwait */
+    pthread_join(g_hilo_senales, NULL);
+    g_senales_activas = 0;
+
+    /* Si llegó un Ctrl+C justo mientras salíamos, consumirlo: al desbloquear la señal
+     * se entregaría con la acción por defecto y mataría el shell. */
+    sigset_t pend, solo_int;
+    sigemptyset(&solo_int);
+    sigaddset(&solo_int, SIGINT);
+    if (sigpending(&pend) == 0 && sigismember(&pend, SIGINT)) {
+        int sig;
+        sigwait(&solo_int, &sig);
+    }
+    pthread_sigmask(SIG_SETMASK, &g_mascara_previa, NULL);
+}
+
+/* El editor marca cuándo está ejecutando un comando y cuándo espera el siguiente. */
+static void inicio_comando(void) {
+    pthread_mutex_lock(&g_salida);
+    g_en_comando = 1;
+    pthread_mutex_unlock(&g_salida);
+}
+
+static void esperar_comando(void) {
+    pthread_mutex_lock(&g_salida);
+    g_en_comando = 0;
+    notificar_job();       /* avisar si una tarea de fondo terminó */
+    imprimir_prompt();     /* muestra el % si hay una tarea en curso */
+    pthread_mutex_unlock(&g_salida);
+}
+
+/**
+ * ====================================================================================
  * COMANDO: editor [archivo]
  * ====================================================================================
  * Punto de entrada registrado en la tabla commands[] del shell (categoría "edicion").
@@ -890,6 +1000,8 @@ int cmd_editor(int argc, char **argv) {
     EditorState ed;
     memset(&ed, 0, sizeof(ed));
     ed.fd = -1;
+
+    senales_iniciar();     /* Ctrl+C cancela la tarea de fondo en vez de matar todo */
 
     printf(COLOR_TITLE "\n--- Editor de Texto Unix (comandos: o, p, a, i, d, s, q | Huffman: c, x, st, w, cancel) ---\n" COLOR_RESET);
 
@@ -910,10 +1022,11 @@ int cmd_editor(int argc, char **argv) {
     char *eargv[MAX_EDITOR_ARGS];
 
     while (1) {
-        notificar_job();       /* avisar si una tarea de fondo terminó */
-        imprimir_prompt();     /* muestra el % si hay una tarea en curso */
+        esperar_comando();     /* aviso de fin de tarea + prompt (bajo g_salida) */
 
-        if (fgets(line, sizeof(line), stdin) == NULL) {
+        char *leida = fgets(line, sizeof(line), stdin);
+        inicio_comando();      /* desde aquí el hilo de señales no imprime */
+        if (leida == NULL) {
             /* EOF (Ctrl+D): como todos los cambios ya se persistieron al hacerse,
              * basta con cerrar el FD y liberar la memoria; no hay nada pendiente
              * que se pueda perder. */
@@ -922,6 +1035,7 @@ int cmd_editor(int argc, char **argv) {
              * de fondo (si existe), se espera y se hace join antes de salir. */
             if (job_busy()) printf(COLOR_INFO "Cancelando la tarea en segundo plano...\n" COLOR_RESET);
             job_shutdown();
+            senales_detener();
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
@@ -1007,6 +1121,7 @@ int cmd_editor(int argc, char **argv) {
                 continue;
             }
             job_shutdown();    /* join del último hilo job (ya terminado) */
+            senales_detener(); /* join del hilo de señales y Ctrl+C vuelve a lo normal */
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);

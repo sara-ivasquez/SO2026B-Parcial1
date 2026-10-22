@@ -167,6 +167,17 @@ void job_mark_seen(void) {
     pthread_mutex_unlock(&g_mutex);
 }
 
+int job_take_unseen(JobStatus *st) {
+    pthread_mutex_lock(&g_mutex);
+    int u = g_st.unseen;
+    if (u) {
+        *st = g_st;
+        g_st.unseen = 0;
+    }
+    pthread_mutex_unlock(&g_mutex);
+    return u;
+}
+
 int job_busy(void) {
     pthread_mutex_lock(&g_mutex);
     int b = is_busy(g_st.state);

@@ -66,6 +66,11 @@ void job_status(JobStatus *st);
 /* Marca el resultado del último job como ya notificado al usuario. */
 void job_mark_seen(void);
 
+/* Si el último job terminó y no se ha notificado, copia su estado en *st, lo marca
+ * como notificado y retorna 1; si no, retorna 0. Revisar y marcar ocurren bajo el
+ * MISMO lock, así dos hilos (el editor y el de señales) nunca avisan dos veces. */
+int  job_take_unseen(JobStatus *st);
+
 /* 1 si hay una tarea en curso (RUNNING o CANCELLING). */
 int  job_busy(void);
 

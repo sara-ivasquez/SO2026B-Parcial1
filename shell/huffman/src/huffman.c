@@ -5,6 +5,7 @@
 #include <stdio.h>     /* SOLO fprintf(stderr) para mensajes; NO se usa para archivos */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* ====================================================================================
@@ -37,6 +38,14 @@ static int write_full(int fd, const void *buf, size_t count) {
         done += (size_t)w;
     }
     return 0;
+}
+
+/* 1 si fd es un archivo regular. Al fallar solo se borra la salida si es un archivo
+ * normal que creamos: si alguien pasa un dispositivo como salida (p.ej. /dev/full),
+ * unlink() borraría el dispositivo en vez de un .huf a medias. */
+static int es_regular(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 /* Serialización little-endian explícita (independiente de la arquitectura). */
@@ -254,7 +263,7 @@ int huf_compress_file(const char *in_path, const char *out_path, uint32_t block_
     /* ---- Cabecera ---- */
     fout = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fout == -1) { fprintf(stderr, "huffman: open('%s'): %s\n", out_path, strerror(errno)); goto done; }
-    out_created = 1;
+    out_created = es_regular(fout);   /* solo se borra si es un archivo normal */
 
     uint8_t hdr[HUF_HEADER_SIZE];
     memcpy(hdr, HUF_MAGIC, 4);
@@ -335,7 +344,7 @@ int huf_decompress_file(const char *in_path, const char *out_path,
 
     fout = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fout == -1) { fprintf(stderr, "huffman: open('%s'): %s\n", out_path, strerror(errno)); goto done; }
-    out_created = 1;
+    out_created = es_regular(fout);   /* solo se borra si es un archivo normal */
 
     size_t ccap = (size_t)block_size * 8 + 8;      /* cota superior: 64 bits por byte */
     cbuf = malloc(ccap);

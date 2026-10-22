@@ -236,6 +236,13 @@ int main(int argc, char **argv) {
         CHECK(rc == -1 && errno == ENOENT, "entrada inexistente -> -1 (ENOENT)");
         rc = huf_compress_file_mt(p_in, "/no/existe/x.huf", 0, pool, NULL);
         CHECK(rc == -1, "salida en carpeta inexistente -> -1");
+        struct stat sf;
+        if (stat("/dev/full", &sf) == 0) {
+            rc = huf_compress_file_mt(p_in, "/dev/full", 4096, pool, NULL);
+            int e = errno;
+            CHECK(rc == -1 && e == ENOSPC && stat("/dev/full", &sf) == 0,
+                  "disco lleno (/dev/full) -> -1 (ENOSPC) y no borra el dispositivo");
+        }
         unlink(p_bad);
     }
 
