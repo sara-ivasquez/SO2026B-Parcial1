@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell.h"
+#include "huf_job.h"     /* Parcial 2: compresión Huffman en segundo plano */
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /**
  * ====================================================================================
@@ -608,6 +610,179 @@ static void editor_buscar(EditorState *ed, const char *palabra) {
 
 /**
  * ====================================================================================
+ * PARCIAL 2 - Compresión Huffman concurrente en segundo plano
+ * ====================================================================================
+ * Comandos nuevos del editor:
+ *   c [archivo]              comprime (por defecto el archivo abierto) -> archivo.huf
+ *   x <archivo.huf> [salida] descomprime (por defecto quita la extensión .huf)
+ *   st                       muestra el estado / porcentaje de la tarea
+ *   w                        muestra la barra de progreso en vivo hasta que termine
+ *   cancel                   cancela la tarea en curso (no deja salida parcial)
+ *
+ * El trabajo pesado corre en otro hilo (huf_job.c), así que el REPL vuelve al prompt
+ * de inmediato y los demás comandos (p, s, ...) siguen respondiendo. El hilo de fondo
+ * NUNCA imprime: este hilo (el del editor) es el único que escribe en la terminal,
+ * por eso el progreso no se mezcla con el prompt ni con las trazas LOG_SYSCALL.
+ */
+
+#define HUF_MAX_HILOS 16
+
+static int hilos_por_defecto(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 4;
+    if (n > HUF_MAX_HILOS) n = HUF_MAX_HILOS;
+    return (int)n;
+}
+
+static double mb(uint64_t bytes) { return bytes / (1024.0 * 1024.0); }
+
+static int porcentaje(const JobStatus *st) {
+    return st->total ? (int)(st->done * 100 / st->total) : 0;
+}
+
+static const char *verbo(const JobStatus *st) {
+    return st->kind == JOB_COMPRESS ? "Compresión" : "Descompresión";
+}
+
+/* Barra de progreso: [##########----------]  50%  (12.0 / 24.0 MB) */
+static void dibujar_barra(const JobStatus *st) {
+    const int ancho = 30;
+    int pct = porcentaje(st);
+    if (st->state == JOB_DONE) pct = 100;
+    int llenos = pct * ancho / 100;
+    printf("\r%s [", st->kind == JOB_COMPRESS ? "comprimiendo  " : "descomprimiendo");
+    for (int i = 0; i < ancho; i++) putchar(i < llenos ? '#' : '-');
+    if (st->total == 0 && st->state == JOB_RUNNING)
+        printf("]   preparando...                              ");
+    else
+        printf("] %3d%%  (%.1f / %.1f MB)%s", pct, mb(st->done), mb(st->total),
+               st->state == JOB_CANCELLING ? "  cancelando..." : "              ");
+    if (st->state != JOB_RUNNING && st->state != JOB_CANCELLING) printf("\n");
+    fflush(stdout);
+}
+
+/* Si la tarea de fondo terminó y aún no se ha avisado, avisar ahora (se llama justo
+ * antes de imprimir el prompt, desde el hilo del editor). */
+static void notificar_job(void) {
+    JobStatus st;
+    job_status(&st);
+    if (!st.unseen) return;
+    job_mark_seen();
+
+    if (st.state == JOB_DONE) {
+        struct stat a, b;
+        double in_mb = stat(st.in_path, &a) == 0 ? mb((uint64_t)a.st_size) : 0;
+        double out_mb = stat(st.out_path, &b) == 0 ? mb((uint64_t)b.st_size) : 0;
+        printf(COLOR_RESULT "[fondo] %s terminada: '%s' -> '%s' (%.2f MB -> %.2f MB) en %.2f s con %d hilos.\n" COLOR_RESET,
+               verbo(&st), st.in_path, st.out_path, in_mb, out_mb, st.elapsed_ms / 1000.0, st.threads);
+    } else if (st.state == JOB_CANCELLED) {
+        printf(COLOR_INFO "[fondo] %s de '%s' cancelada. No quedó archivo parcial.\n" COLOR_RESET,
+               verbo(&st), st.in_path);
+    } else if (st.state == JOB_FAILED) {
+        printf(COLOR_ERROR "[fondo] %s de '%s' falló: %s\n" COLOR_RESET,
+               verbo(&st), st.in_path, strerror(st.err));
+    }
+}
+
+static void imprimir_prompt(void) {
+    JobStatus st;
+    job_status(&st);
+    if (st.state == JOB_RUNNING || st.state == JOB_CANCELLING)
+        printf(COLOR_PROMPT "editor " COLOR_PARAM "[%s %d%%]" COLOR_PROMPT "> " COLOR_RESET,
+               st.kind == JOB_COMPRESS ? "comprimiendo" : "descomprimiendo", porcentaje(&st));
+    else
+        printf(COLOR_PROMPT "editor> " COLOR_RESET);
+    fflush(stdout);
+}
+
+static void lanzar_job(JobKind kind, const char *in, const char *out) {
+    int n = hilos_por_defecto();
+    if (job_start(kind, in, out, n) == -1) {
+        if (errno == EBUSY)
+            printf(COLOR_ERROR "Ya hay una tarea en segundo plano. Use 'st', 'w' o 'cancel'.\n" COLOR_RESET);
+        else
+            printf(COLOR_ERROR "No se pudo iniciar la tarea: %s\n" COLOR_RESET, strerror(errno));
+        return;
+    }
+    printf(COLOR_RESULT "%s iniciada en segundo plano con %d hilos: '%s' -> '%s'.\n" COLOR_RESET,
+           kind == JOB_COMPRESS ? "Compresión" : "Descompresión", n, in, out);
+    printf(COLOR_INFO "Puede seguir usando el editor. 'st' = estado, 'w' = progreso en vivo, 'cancel' = cancelar.\n" COLOR_RESET);
+}
+
+static void editor_comprimir(EditorState *ed, const char *arg) {
+    const char *in = arg ? arg : (ed->fd != -1 ? ed->filename : NULL);
+    if (!in) {
+        printf(COLOR_ERROR "Uso: c [archivo]  (sin argumento comprime el archivo abierto)\n" COLOR_RESET);
+        return;
+    }
+    char out[512];
+    snprintf(out, sizeof out, "%s.huf", in);
+    lanzar_job(JOB_COMPRESS, in, out);
+}
+
+static void editor_descomprimir(const char *in, const char *salida) {
+    if (!in) {
+        printf(COLOR_ERROR "Uso: x <archivo.huf> [salida]\n" COLOR_RESET);
+        return;
+    }
+    char out[512];
+    if (salida) {
+        snprintf(out, sizeof out, "%s", salida);
+    } else {
+        size_t n = strlen(in);
+        if (n <= 4 || strcmp(in + n - 4, ".huf") != 0) {
+            printf(COLOR_ERROR "'%s' no termina en .huf; indique la salida: x <archivo.huf> <salida>\n" COLOR_RESET, in);
+            return;
+        }
+        snprintf(out, sizeof out, "%.*s", (int)(n - 4), in);
+        struct stat sb;
+        if (stat(out, &sb) == 0) {   /* no pisar un archivo existente sin que lo pidan */
+            printf(COLOR_ERROR "'%s' ya existe. Indique otro nombre: x %s <salida>\n" COLOR_RESET, out, in);
+            return;
+        }
+    }
+    lanzar_job(JOB_DECOMPRESS, in, out);
+}
+
+static void editor_estado(void) {
+    JobStatus st;
+    job_status(&st);
+    if (st.state == JOB_IDLE) {
+        printf(COLOR_INFO "No se ha lanzado ninguna compresión en esta sesión.\n" COLOR_RESET);
+        return;
+    }
+    if (st.state == JOB_RUNNING || st.state == JOB_CANCELLING) {
+        dibujar_barra(&st);
+        printf("\n");
+        return;
+    }
+    job_mark_seen();
+    const char *res = st.state == JOB_DONE ? "terminada" : st.state == JOB_CANCELLED ? "cancelada" : "fallida";
+    printf(COLOR_INFO "Última tarea: %s de '%s' -> '%s': %s" COLOR_RESET, verbo(&st), st.in_path, st.out_path, res);
+    if (st.state == JOB_FAILED) printf(COLOR_ERROR " (%s)" COLOR_RESET, strerror(st.err));
+    printf("\n");
+}
+
+static void editor_ver_progreso(void) {
+    if (!job_busy()) { editor_estado(); return; }
+    job_watch(dibujar_barra);   /* duerme hasta cada avance; vuelve al terminar */
+    notificar_job();
+}
+
+static void editor_cancelar(void) {
+    if (job_cancel() == -1) {
+        printf(COLOR_INFO "No hay ninguna tarea en curso.\n" COLOR_RESET);
+        return;
+    }
+    printf(COLOR_INFO "Cancelando... " COLOR_RESET);
+    fflush(stdout);
+    job_wait();                 /* el job se detiene al terminar el bloque actual */
+    printf("listo.\n");
+    notificar_job();
+}
+
+/**
+ * ====================================================================================
  * COMANDO: editor [archivo]
  * ====================================================================================
  * Punto de entrada registrado en la tabla commands[] del shell (categoría "edicion").
@@ -620,7 +795,7 @@ int cmd_editor(int argc, char **argv) {
     memset(&ed, 0, sizeof(ed));
     ed.fd = -1;
 
-    printf(COLOR_TITLE "\n--- Editor de Texto Unix (comandos: o, p, a, i, d, s, q) ---\n" COLOR_RESET);
+    printf(COLOR_TITLE "\n--- Editor de Texto Unix (comandos: o, p, a, i, d, s, q | Huffman: c, x, st, w, cancel) ---\n" COLOR_RESET);
 
     /* Si se invocó como 'editor <archivo>', abrirlo automáticamente al entrar */
     if (argc == 2) {
@@ -639,14 +814,18 @@ int cmd_editor(int argc, char **argv) {
     char *eargv[MAX_EDITOR_ARGS];
 
     while (1) {
-        printf(COLOR_PROMPT "editor> " COLOR_RESET);
-        fflush(stdout);
+        notificar_job();       /* avisar si una tarea de fondo terminó */
+        imprimir_prompt();     /* muestra el % si hay una tarea en curso */
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
             /* EOF (Ctrl+D): como todos los cambios ya se persistieron al hacerse,
              * basta con cerrar el FD y liberar la memoria; no hay nada pendiente
              * que se pueda perder. */
             printf("\n");
+            /* Ctrl+D: no hay forma de seguir preguntando, así que se cancela la tarea
+             * de fondo (si existe), se espera y se hace join antes de salir. */
+            if (job_busy()) printf(COLOR_INFO "Cancelando la tarea en segundo plano...\n" COLOR_RESET);
+            job_shutdown();
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
@@ -724,6 +903,11 @@ int cmd_editor(int argc, char **argv) {
             }
             editor_buscar(&ed, eargc >= 2 ? palabra_buf : NULL);
         } else if (strcmp(eargv[0], "q") == 0) {
+            if (job_busy()) {
+                printf(COLOR_ERROR "Hay una tarea en segundo plano. Use 'w' para esperarla o 'cancel' para cancelarla antes de salir.\n" COLOR_RESET);
+                continue;
+            }
+            job_shutdown();    /* join del último hilo job (ya terminado) */
             if (ed.fd != -1) {
                 LOG_SYSCALL("close", "%d", ed.fd);
                 int cres = close(ed.fd);
@@ -733,8 +917,18 @@ int cmd_editor(int argc, char **argv) {
             editor_liberar(&ed);
             printf(COLOR_INFO "Saliendo del editor...\n\n" COLOR_RESET);
             break;
+        } else if (strcmp(eargv[0], "c") == 0) {
+            editor_comprimir(&ed, eargc >= 2 ? eargv[1] : NULL);
+        } else if (strcmp(eargv[0], "x") == 0) {
+            editor_descomprimir(eargc >= 2 ? eargv[1] : NULL, eargc >= 3 ? eargv[2] : NULL);
+        } else if (strcmp(eargv[0], "st") == 0) {
+            editor_estado();
+        } else if (strcmp(eargv[0], "w") == 0) {
+            editor_ver_progreso();
+        } else if (strcmp(eargv[0], "cancel") == 0) {
+            editor_cancelar();
         } else {
-            printf(COLOR_ERROR "Comando '%s' no reconocido. Use: o, p, a, i, d, s, q\n" COLOR_RESET, eargv[0]);
+            printf(COLOR_ERROR "Comando '%s' no reconocido. Use: o, p, a, i, d, s, q, c, x, st, w, cancel\n" COLOR_RESET, eargv[0]);
         }
     }
 

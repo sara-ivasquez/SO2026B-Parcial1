@@ -1,5 +1,5 @@
 # Módulo Huffman concurrente (Parcial 2). Independiente del Makefile del shell;
-# en la Fase 5 el shell lo enlazará con -Ihuffman/include y los .c de huffman/src.
+# el Makefile del shell (../Makefile) enlaza estos mismos .c dentro de eafitOS.
 #
 #   make           compila huf y los programas de prueba
 #   make test      pruebas de las Fases 1 a 4
@@ -9,8 +9,8 @@
 #   make clean
 CC     = gcc
 CFLAGS = -Wall -Wextra -std=gnu99 -g -D_GNU_SOURCE -pthread -Iinclude
-HDR    = include/huffman.h include/threadpool.h include/huf_parallel.h
-SRC    = src/huffman.c src/threadpool.c src/huf_parallel.c
+HDR    = include/huffman.h include/threadpool.h include/huf_parallel.h include/huf_job.h
+SRC    = src/huffman.c src/threadpool.c src/huf_parallel.c src/huf_job.c
 BIN    = huf
 TPOOL  = test_pool
 TCOUNT = test_count

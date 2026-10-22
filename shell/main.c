@@ -136,8 +136,8 @@ Command commands[] = {
     {
         "editor", "edicion",
         "editor [archivo]",
-        "Editor de texto interactivo: o/p/a/i/d/s/q (abrir, imprimir, agregar, insertar, borrar, buscar, salir).",
-        "open(2), read(2), write(2), lseek(2), ftruncate(2), close(2)",
+        "Editor de texto interactivo: o/p/a/i/d/s/q (abrir, imprimir, agregar, insertar, borrar, buscar, salir) + Huffman concurrente en segundo plano: c/x/st/w/cancel (comprimir, descomprimir, estado, ver progreso, cancelar).",
+        "open(2), read(2), write(2), lseek(2), ftruncate(2), close(2), pread(2), pthread_create(3), pthread_mutex_*(3), pthread_cond_*(3)",
         cmd_editor
     }
 };
