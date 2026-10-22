@@ -695,6 +695,100 @@ static void imprimir_prompt(void) {
     fflush(stdout);
 }
 
+/**
+ * ====================================================================================
+ * PARCIAL 2, FASE 6 - Condiciones de carrera entre el editor y la tarea de fondo
+ * ====================================================================================
+ * Riesgo: el hilo job lee el archivo de entrada (por bloques, con pread) y escribe el
+ * de salida mientras el usuario sigue usando el editor. Si el usuario hiciera 'a', 'i'
+ * o 'd' sobre ESE archivo a mitad de camino, la compresión leería una mezcla de la
+ * versión vieja y la nueva (un .huf inconsistente), o el editor pisaría bytes que el
+ * job está escribiendo.
+ *
+ * Política (se explica y defiende en la sustentación):
+ *   1. Mientras haya una tarea en curso, 'a', 'i' y 'd' se RECHAZAN si el archivo
+ *      abierto es la entrada o la salida de esa tarea. Se puede seguir leyendo (p, s)
+ *      porque leer no modifica nada. Sobre cualquier OTRO archivo se edita normal.
+ *   2. No se lanza una tarea cuya salida sea el archivo abierto en el editor ni su
+ *      propia entrada (se truncaría el archivo que se está leyendo).
+ *   3. No se puede abrir con 'o' un archivo que la tarea está generando (se vería a
+ *      medias).
+ *   4. 'q' no sale con una tarea en curso; Ctrl+D la cancela y espera antes de salir.
+ *
+ * "El mismo archivo" se compara por IDENTIDAD (dispositivo + número de inodo, con
+ * stat/fstat) y no por el texto de la ruta: "notas.txt", "./notas.txt" y la ruta
+ * absoluta son el mismo archivo y deben bloquearse igual.
+ *
+ * Por qué basta revisar y luego editar (sin tener un lock durante toda la edición):
+ * el estado de la tarea se lee con job_status(), que copia todo bajo el mutex del job,
+ * y la ÚNICA forma de que empiece una tarea nueva es que este mismo hilo ejecute 'c' o
+ * 'x'. Entre la revisión y la escritura este hilo no hace otra cosa, así que ninguna
+ * tarea puede empezar en medio; lo único que puede pasar es que la tarea en curso
+ * TERMINE, y eso solo hace la edición más segura, no menos.
+ */
+
+/* 1 si 'path' existe y es exactamente el archivo descrito por 'b' (mismo inodo). */
+static int mismo_archivo(const char *path, const struct stat *b) {
+    struct stat a;
+    return stat(path, &a) == 0 && a.st_dev == b->st_dev && a.st_ino == b->st_ino;
+}
+
+/* 1 si dos rutas existen y apuntan al mismo archivo. */
+static int rutas_mismo_archivo(const char *p1, const char *p2) {
+    struct stat b;
+    return stat(p2, &b) == 0 && mismo_archivo(p1, &b);
+}
+
+/* 1 si el archivo abierto en el editor es la entrada o la salida de la tarea en curso. */
+static int archivo_abierto_en_uso(EditorState *ed, JobStatus *st) {
+    if (ed->fd == -1) return 0;
+    job_status(st);
+    if (st->state != JOB_RUNNING && st->state != JOB_CANCELLING) return 0;
+    struct stat mio;
+    if (fstat(ed->fd, &mio) == -1) return 0;
+    return mismo_archivo(st->in_path, &mio) || mismo_archivo(st->out_path, &mio);
+}
+
+/* Guardia para los comandos que MODIFICAN el archivo (a, i, d).
+ * Retorna 1 (y explica por qué) si la operación debe rechazarse. */
+static int bloqueado_por_job(EditorState *ed, const char *operacion) {
+    JobStatus st;
+    if (!archivo_abierto_en_uso(ed, &st)) return 0;
+    printf(COLOR_ERROR "No se puede %s: '%s' se está %s en segundo plano (%d%%).\n" COLOR_RESET,
+           operacion, ed->filename,
+           st.kind == JOB_COMPRESS ? "comprimiendo" : "descomprimiendo", porcentaje(&st));
+    printf(COLOR_INFO "Puede leerlo con 'p' o 's'. Use 'w' para esperar o 'cancel' para cancelar la tarea.\n" COLOR_RESET);
+    return 1;
+}
+
+/* 'o' no puede abrir el archivo que la tarea en curso está GENERANDO: se vería a
+ * medias y, como 'o' usa O_CREAT, incluso podría crearlo antes que el job. Se compara
+ * por inodo y, si todavía no existe, por la ruta tal cual. */
+static int apertura_permitida(const char *path) {
+    JobStatus st;
+    job_status(&st);
+    if (st.state != JOB_RUNNING && st.state != JOB_CANCELLING) return 1;
+    if (strcmp(path, st.out_path) == 0 || rutas_mismo_archivo(path, st.out_path)) {
+        printf(COLOR_ERROR "'%s' se está generando en segundo plano; ábralo cuando termine ('w' para esperar).\n" COLOR_RESET, path);
+        return 0;
+    }
+    return 1;
+}
+
+/* Valida que la salida de una tarea nueva no choque con el editor ni con la entrada. */
+static int salida_valida(EditorState *ed, const char *in, const char *out) {
+    if (rutas_mismo_archivo(in, out)) {
+        printf(COLOR_ERROR "La salida '%s' es el mismo archivo que la entrada.\n" COLOR_RESET, out);
+        return 0;
+    }
+    struct stat mio;
+    if (ed->fd != -1 && fstat(ed->fd, &mio) == 0 && mismo_archivo(out, &mio)) {
+        printf(COLOR_ERROR "La salida '%s' es el archivo abierto en el editor; ciérrelo o use otro nombre.\n" COLOR_RESET, out);
+        return 0;
+    }
+    return 1;
+}
+
 static void lanzar_job(JobKind kind, const char *in, const char *out) {
     int n = hilos_por_defecto();
     if (job_start(kind, in, out, n) == -1) {
@@ -717,10 +811,11 @@ static void editor_comprimir(EditorState *ed, const char *arg) {
     }
     char out[512];
     snprintf(out, sizeof out, "%s.huf", in);
+    if (!salida_valida(ed, in, out)) return;
     lanzar_job(JOB_COMPRESS, in, out);
 }
 
-static void editor_descomprimir(const char *in, const char *salida) {
+static void editor_descomprimir(EditorState *ed, const char *in, const char *salida) {
     if (!in) {
         printf(COLOR_ERROR "Uso: x <archivo.huf> [salida]\n" COLOR_RESET);
         return;
@@ -741,6 +836,7 @@ static void editor_descomprimir(const char *in, const char *salida) {
             return;
         }
     }
+    if (!salida_valida(ed, in, out)) return;
     lanzar_job(JOB_DECOMPRESS, in, out);
 }
 
@@ -857,12 +953,13 @@ int cmd_editor(int argc, char **argv) {
         if (strcmp(eargv[0], "o") == 0) {
             if (eargc < 2) {
                 printf(COLOR_ERROR "Uso: o <archivo>\n" COLOR_RESET);
-            } else {
+            } else if (apertura_permitida(eargv[1])) {
                 editor_abrir(&ed, eargv[1]);
             }
         } else if (strcmp(eargv[0], "p") == 0) {
             editor_imprimir(&ed, eargc >= 2 ? eargv[1] : NULL);
         } else if (strcmp(eargv[0], "a") == 0) {
+            if (bloqueado_por_job(&ed, "agregar")) continue;
             char texto_buf[MAX_LINE_LEN];
             texto_buf[0] = '\0';
             for (int i = 1; i < eargc; i++) {
@@ -873,6 +970,7 @@ int cmd_editor(int argc, char **argv) {
             }
             editor_agregar(&ed, texto_buf);
         } else if (strcmp(eargv[0], "i") == 0) {
+            if (bloqueado_por_job(&ed, "insertar")) continue;
             if (eargc < 3) {
                 printf(COLOR_ERROR "Uso: i <n> <texto>\n" COLOR_RESET);
             } else {
@@ -887,6 +985,7 @@ int cmd_editor(int argc, char **argv) {
                 editor_insertar(&ed, eargv[1], texto_buf);
             }
         } else if (strcmp(eargv[0], "d") == 0) {
+            if (bloqueado_por_job(&ed, "borrar")) continue;
             if (eargc < 2) {
                 printf(COLOR_ERROR "Uso: d <n>\n" COLOR_RESET);
             } else {
@@ -920,7 +1019,7 @@ int cmd_editor(int argc, char **argv) {
         } else if (strcmp(eargv[0], "c") == 0) {
             editor_comprimir(&ed, eargc >= 2 ? eargv[1] : NULL);
         } else if (strcmp(eargv[0], "x") == 0) {
-            editor_descomprimir(eargc >= 2 ? eargv[1] : NULL, eargc >= 3 ? eargv[2] : NULL);
+            editor_descomprimir(&ed, eargc >= 2 ? eargv[1] : NULL, eargc >= 3 ? eargv[2] : NULL);
         } else if (strcmp(eargv[0], "st") == 0) {
             editor_estado();
         } else if (strcmp(eargv[0], "w") == 0) {
