@@ -1,0 +1,17 @@
+# Falso positivo conocido de helgrind con glibc >= 2.25: la implementación interna de
+# pthread_cond_wait() hace una señal propia sin el mutex tomado (pthread_cond_wait.c).
+# No viene de nuestro código: solo se suprime ese caso exacto (avisos Misc/Dubious
+# originados DENTRO de __pthread_cond_wait_common). Las carreras de datos (Race) y los
+# problemas de orden de locks (LockOrder) se siguen reportando normalmente.
+{
+   glibc-cond-wait-senal-interna-misc
+   Helgrind:Misc
+   obj:*vgpreload_helgrind*
+   fun:__pthread_cond_wait_common
+}
+{
+   glibc-cond-wait-senal-interna-dubious
+   Helgrind:Dubious
+   obj:*vgpreload_helgrind*
+   fun:__pthread_cond_wait_common
+}

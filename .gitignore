@@ -4,3 +4,5 @@ Banderas_CLI/*.o
 Banderas_CLI/cli_parser
 shell/eafitOS
 shell/huffman/huf
+shell/huffman/test_pool
+shell/huffman/test_pool_tsan

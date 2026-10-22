@@ -1,2 +1,3 @@
 *.sh text eol=lf
 Makefile text eol=lf
+*.supp text eol=lf
